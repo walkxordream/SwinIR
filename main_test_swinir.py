@@ -13,6 +13,8 @@ from utils import util_calculate_psnr_ssim as util
 
 def main():
     parser = argparse.ArgumentParser()
+    #コマンドライン引数の設定をしている
+    #parser.add_argument('使いたい引数の指定', type=属性の指定, default=引数で指定されなかったときのデフォルト値の設定, help='ヘルプされたときのメッセージの生成')
     parser.add_argument('--task', type=str, default='color_dn', help='classical_sr, lightweight_sr, real_sr, '
                                                                      'gray_dn, color_dn, jpeg_car, color_jpeg_car')
     parser.add_argument('--scale', type=int, default=1, help='scale factor: 1, 2, 3, 4, 8') # 1 for dn and jpeg car
@@ -30,10 +32,12 @@ def main():
     parser.add_argument('--tile_overlap', type=int, default=32, help='Overlapping of different tiles')
     args = parser.parse_args()
 
+    # gpuが使えるかどうかの確認
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # set up model
+    # コマンドラインで指定されたモデルが存在するかの確認
     if os.path.exists(args.model_path):
         print(f'loading model from {args.model_path}')
+    #　存在しない場合はダウンロードする    
     else:
         os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
         url = 'https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/{}'.format(os.path.basename(args.model_path))
@@ -41,13 +45,17 @@ def main():
         print(f'downloading model {args.model_path}')
         open(args.model_path, 'wb').write(r.content)
 
+    # ここまでで諸々設定したargsを使ってモデルを定義する
+    # define_model関数の詳細は下にあるよ
     model = define_model(args)
     model.eval()
     model = model.to(device)
 
-    # setup folder and path
+    # argsからfolder, save_dir, border, window_sizeを取得する
+    # setup関数の詳細は下にあるよ
     folder, save_dir, border, window_size = setup(args)
     os.makedirs(save_dir, exist_ok=True)
+    # test結果を保存するための順序付き辞書を作成
     test_results = OrderedDict()
     test_results['psnr'] = []
     test_results['ssim'] = []
@@ -57,36 +65,52 @@ def main():
     test_results['psnrb_y'] = []
     psnr, ssim, psnr_y, ssim_y, psnrb, psnrb_y = 0, 0, 0, 0, 0, 0
 
+    # 画像を一枚ずつ処理していく
     for idx, path in enumerate(sorted(glob.glob(os.path.join(folder, '*')))):
-        # read image
+        # 画像を読み込んでnumpyにしてデバイスに乗せるよ
+        # get_image_pair関数の詳細は下にあるよ
+        # get_image_pair関数は画像のパスを受け取って、画像の名前、低画質画像、高画質画像を返す(低画質のがない場合は自分でノイズを加えるたりしている)
+        # lq=low quality, gt=ground truth
         imgname, img_lq, img_gt = get_image_pair(args, path)  # image to HWC-BGR, float32
         img_lq = np.transpose(img_lq if img_lq.shape[2] == 1 else img_lq[:, :, [2, 1, 0]], (2, 0, 1))  # HCW-BGR to CHW-RGB
         img_lq = torch.from_numpy(img_lq).float().unsqueeze(0).to(device)  # CHW-RGB to NCHW-RGB
 
-        # inference
+        # 学習海モデルを使うときにはtorch.no_grad()を使う
         with torch.no_grad():
-            # pad input image to be a multiple of window_size
+            # 画像の高さと幅を取得して、window_sizeの倍数になるようにパディングする
             _, _, h_old, w_old = img_lq.size()
             h_pad = (h_old // window_size + 1) * window_size - h_old
             w_pad = (w_old // window_size + 1) * window_size - w_old
             img_lq = torch.cat([img_lq, torch.flip(img_lq, [2])], 2)[:, :, :h_old + h_pad, :]
             img_lq = torch.cat([img_lq, torch.flip(img_lq, [3])], 3)[:, :, :, :w_old + w_pad]
+            #　パディングした画像をモデルに通す
+            # test関数の詳細は下にある
             output = test(img_lq, model, args, window_size)
+            # パディングした部分を削除する
             output = output[..., :h_old * args.scale, :w_old * args.scale]
 
-        # save image
+        # モデルに通した画像を保存する（数字の範囲を0〜1に変換）
         output = output.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+        # テンソルをnumpyに変換して、cv2で保存するためにRGBからBGRに変換する
         if output.ndim == 3:
-            output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
+            output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))
+        #　画像を保存するために0〜1にした数字を0〜255に変換してuint8に変換する
         output = (output * 255.0).round().astype(np.uint8)  # float32 to uint8
         cv2.imwrite(f'{save_dir}/{imgname}_SwinIR.png', output)
 
-        # evaluate psnr/ssim/psnr_b
+        # ここからは画像の評価を行う
+        # 画像の評価を行うときは、高画質画像がある場合のみ行う
+        #　高画質の画像にはここまで何もしていないので、同じようにnumpyに変換する
         if img_gt is not None:
-            img_gt = (img_gt * 255.0).round().astype(np.uint8)  # float32 to uint8
+            img_gt = (img_gt * 255.0).round().astype(np.uint8)
+            # lq画像のサイズに合わせてgt画像をクロップする  
             img_gt = img_gt[:h_old * args.scale, :w_old * args.scale, ...]  # crop gt
+            # 不要な次元の削除
             img_gt = np.squeeze(img_gt)
-
+            # psnr, ssimを計算する
+            # これからの話はすごい難しいので、詳しくはutils.pyを見て欲しい
+            # 簡単に言うと、psnrはピーク信号対雑音比、ssimは構造的類似性を表す指標
+            # つまり、psnrが高いほど画像が綺麗で、ssimが高いほど画像が元画像に近い
             psnr = util.calculate_psnr(output, img_gt, crop_border=border)
             ssim = util.calculate_ssim(output, img_gt, crop_border=border)
             test_results['psnr'].append(psnr)
@@ -108,7 +132,9 @@ def main():
         else:
             print('Testing {:d} {:20s}'.format(idx, imgname))
 
-    # summarize psnr/ssim
+    # psnrbを計算するために、psnrを平均する
+    # psnrbとは、JPEG圧縮後の画像と元画像のpsnrを計算するもの
+    # これも難しいので省略
     if img_gt is not None:
         ave_psnr = sum(test_results['psnr']) / len(test_results['psnr'])
         ave_ssim = sum(test_results['ssim']) / len(test_results['ssim'])
@@ -126,6 +152,8 @@ def main():
 
 
 def define_model(args):
+
+# コマンドライン引数のtaskによって、モデルの設定を変える
     # 001 classical image sr
     if args.task == 'classical_sr':
         model = net(upscale=args.scale, in_chans=3, img_size=args.training_patch_size, window_size=8,
@@ -193,6 +221,7 @@ def define_model(args):
 
 
 def setup(args):
+    # コマンドライン引数のtaskによって、folder, save_dir, border, window_sizeを変える
     # 001 classical image sr/ 002 lightweight image sr
     if args.task in ['classical_sr', 'lightweight_sr']:
         save_dir = f'results/swinir_{args.task}_x{args.scale}'
@@ -227,6 +256,7 @@ def setup(args):
 
 
 def get_image_pair(args, path):
+    # 画像の名前を取得する
     (imgname, imgext) = os.path.splitext(os.path.basename(path))
 
     # 001 classical image sr/ 002 lightweight image sr (load lq-gt image pairs)
